@@ -1,6 +1,6 @@
-# JSON Merge, Patch, Validate & Canonicalize Service
+# JSON Merge, Patch, Diff, Validate & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供四个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供五个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,9 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /diff`：接收任意 JSON 值 `source` 与 `target`，返回把 source 变为
+  target 所需的 RFC 6902 `operations`，可直接原样交给 `/patch`；对象按成员递归
+  比较，数组按最长公共子序列对齐，公共位置继续递归而非整段替换。
 - `POST /validate`：接收 JSON Schema `schema` 与任意 JSON `document`，按
   [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core)
   校验；仅允许 schema 内 `#` 本地引用，远程/无法解析的引用或无效 schema 返回
@@ -166,6 +169,89 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 路径按 RFC 6901 以 `/` 分隔；键名中的特殊字符用 `~1` 表示 `/`、`~0` 表示
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
+
+### `POST /diff`
+
+请求体含两个**任意 JSON 值**（对象、数组、标量、甚至根级别的 `null` 均可）：
+
+| 字段     | 类型    | 说明                       |
+| -------- | ------- | -------------------------- |
+| `source` | 任意 JSON | 原始值                    |
+| `target` | 任意 JSON | 目标值                    |
+
+**成功 → `200`**，返回 `operations`，即把 `source` 逐条变成 `target` 的
+RFC 6902 操作列表，**可直接原样作为 `/patch` 的 `operations`**：
+
+```json
+{
+  "operations": [
+    { "op": "add",     "path": "/a/-",   "value": 4 },
+    { "op": "replace", "path": "/b/x",   "value": 2 },
+    { "op": "add",     "path": "/b/y",   "value": 3 },
+    { "op": "remove",  "path": "/gone" },
+    { "op": "add",     "path": "/new",   "value": "v" }
+  ]
+}
+```
+
+与 `/patch` 串联：
+
+```bash
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":{"a":[1,2],"b":1},"target":{"a":[1,2,3],"b":2}}'
+# => {"operations":[{"op":"add","path":"/a/-","value":3},
+#                   {"op":"replace","path":"/b","value":2}]}
+```
+
+差异生成规则：
+
+| 情形                                   | 生成的操作                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------------- |
+| source 与 target 结构相等              | `[]`（`1` 与 `1.0` 视为相等，`true` 与 `1` 不等）                          |
+| 对象共有成员且值不同                   | 按成员**递归**比较，只生成最小操作；对象成员按 Unicode 码点序处理（确定性） |
+| 对象 target 多出/少掉的成员            | `add` / `remove`（`add` 到已存在成员时与 `replace` 等价）                  |
+| 数组                                   | 以 JSON 相等计算**最长公共子序列（LCS）**：公共位置保留并继续递归，多出来的 source 元素按高索引优先 `remove`，多出来的 target 元素在锚点前逆序 `add`（末尾用 `/-` 追加） |
+| 锚点之间同偏移的一对一异值元素         | 递归比较；叶子差异为单条 `replace`，而非一条 `remove` + 一条 `add`          |
+| 类型变化（对象↔数组↔标量）或标量变化   | 单条 `replace`                                                             |
+| 根级整体变化                           | 根指针 `""` 上的 `replace`（`/patch` 支持替换整个文档）                    |
+
+关键点：
+
+- **JSON Pointer 正确转义**：成员名中的 `~` 写作 `~0`、`/` 写作 `~1`
+  （如成员 `a/b` → `/a~1b`，成员 `~x` → `/~0x`），数组位置仍为数字索引。
+- **操作顺序保证可直接应用**：数组删除总是高索引先执行、插入在锚点前逆序执行，
+  因此前面的操作不会让后续路径失效；把返回的 `operations` 逐条交给 `/patch`，
+  结果**恰好**等于 `target`。
+- **避免整段替换**：数组中大部分元素相同、仅个别增删改时，不会替换整个数组；
+  公共位置的对象/数组还会继续向下递归。
+- **结果确定性**：相同输入永远返回字节相同的操作列表（成员按码点序、LCS 回溯
+  平局时优先跳过 source 元素）。
+- 不修改请求中的 `source`/`target`；操作里的 `value` 在 `/patch` 中还会再做一次
+  深拷贝。
+
+```bash
+# 数组小改：保留公共元素、公共位置递归，而不是整段替换
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":[{"id":1,"v":0},{"id":2}],"target":[{"id":1,"v":1},{"id":2},{"id":3}]}'
+# => {"operations":[{"op":"replace","path":"/0/v","value":1},
+#                   {"op":"add","path":"/-","value":{"id":3}}]}
+
+# 相同输入 → 空数组
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":{"a":[1,2]},"target":{"a":[1,2]}}'
+# => {"operations":[]}
+
+# 类型变化 → replace
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":{"a":1},"target":{"a":[1]}}'
+# => {"operations":[{"op":"replace","path":"/a","value":[1]}]}
+```
+
+**缺少 `source` 或 `target` 字段、或请求体无法解析为 JSON → `422`**。
 
 ### `POST /validate`
 
@@ -332,6 +418,18 @@ curl -s -X POST http://localhost:8000/patch \
   -d '{"document":{"a":1},"operations":[{"op":"add","path":"/b","value":2},{"op":"test","path":"/a","value":99}]}'
 # => 409 {"detail":"patch conflict","failed_index":1,"path":"/a","reason":"test failed: ..."}
 
+# 生成 diff（返回的 operations 可直接交给 /patch）
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":{"a":[1,2,3],"b":1},"target":{"a":[1,2,3,4],"b":2}}'
+# => {"operations":[{"op":"add","path":"/a/-","value":4},{"op":"replace","path":"/b","value":2}]}
+
+# diff 数组：LCS 对齐，公共位置递归，不整段替换
+curl -s -X POST http://localhost:8000/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"source":[1,2,3],"target":[1,9,3]}'
+# => {"operations":[{"op":"replace","path":"/1","value":9}]}
+
 # RFC 8785 规范化（键排序 + 确定性数字 + 仅必要转义）
 curl -s -X POST http://localhost:8000/canonicalize \
   -H 'Content-Type: application/json' \
@@ -372,13 +470,15 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch、/validate 与 /canonicalize 入口
+app/main.py           # FastAPI 应用：/merge、/patch、/diff、/validate 与 /canonicalize 入口
 app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
+app/diff.py           # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
 app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
-app/jsonutil.py       # JSON 相等性与 MISSING 哨兵（接口共用）
+app/jsonutil.py       # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
+tests/test_diff.py         # /diff 测试（含 diff→/patch 随机往返）
 tests/test_validate.py     # /validate 测试
 tests/test_canonicalize.py # /canonicalize 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）

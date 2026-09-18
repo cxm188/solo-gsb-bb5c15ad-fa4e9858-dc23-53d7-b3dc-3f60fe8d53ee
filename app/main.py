@@ -1,4 +1,4 @@
-"""JSON merge and patch service.
+"""JSON merge, patch, diff and validation service.
 
 * ``POST /merge`` accepts ``{"base": ..., "left": ..., "right": ...}`` and
   merges the changes that left and right each made relative to base:
@@ -16,6 +16,12 @@
   operations to a deep copy of the document. Malformed requests yield 422;
   unresolvable paths, out-of-bounds array indices and failed ``test``
   operations yield 409 without any partial result.
+
+* ``POST /diff`` accepts ``{"source": ..., "target": ...}`` and returns the
+  RFC 6902 ``operations`` that transform source into target; objects are
+  compared recursively by member (RFC 6901 escaping included) and arrays are
+  aligned by longest common subsequence, so common positions are recursed
+  rather than replaced wholesale.
 
 * ``POST /canonicalize`` accepts ``{"document": ...}`` and returns the
   RFC 8785 (JCS) canonical JSON text together with its SHA-256 digest.
@@ -38,16 +44,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .canonicalize import CanonicalizationError, canonicalize
-from .jsonutil import MISSING, json_equal
+from .diff import make_patch
+from .jsonutil import MISSING, escape_pointer, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
 from .validate import SchemaValidationError, build_validator, leaf_errors
 
-app = FastAPI(title="JSON Merge, Patch, Validate & Canonicalize Service", version="1.3.0")
-
-
-def escape_pointer(token: str) -> str:
-    """Escape one reference token as per RFC 6901."""
-    return token.replace("~", "~0").replace("/", "~1")
+app = FastAPI(title="JSON Merge, Patch, Diff, Validate & Canonicalize Service", version="1.4.0")
 
 
 def merge3(base: Any, left: Any, right: Any, path: str, conflicts: list) -> Any:
@@ -162,6 +164,16 @@ def patch_endpoint(request: PatchRequest):
             content["path"] = exc.path
         return JSONResponse(status_code=422, content=content)
     return {"document": document}
+
+
+class DiffRequest(BaseModel):
+    source: Any = Field(...)
+    target: Any = Field(...)
+
+
+@app.post("/diff")
+def diff_endpoint(request: DiffRequest):
+    return {"operations": make_patch(request.source, request.target)}
 
 
 class CanonicalizeRequest(BaseModel):

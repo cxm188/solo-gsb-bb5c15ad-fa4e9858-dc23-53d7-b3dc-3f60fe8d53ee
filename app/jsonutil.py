@@ -1,8 +1,13 @@
-"""JSON helpers shared by the merge and patch services."""
+"""JSON helpers shared by the merge, patch and diff services."""
 
 from __future__ import annotations
 
 from typing import Any
+
+
+def escape_pointer(token: str) -> str:
+    """Escape one reference token as per RFC 6901."""
+    return token.replace("~", "~0").replace("/", "~1")
 
 
 class _Missing:
