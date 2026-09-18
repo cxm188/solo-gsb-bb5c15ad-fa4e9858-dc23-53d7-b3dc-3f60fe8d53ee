@@ -17,6 +17,13 @@
   unresolvable paths, out-of-bounds array indices and failed ``test``
   operations yield 409 without any partial result.
 
+* ``POST /diff`` accepts ``{"source": ..., "target": ...}`` and returns the
+  RFC 6902 ``operations`` that turn source into target; the response can be
+  handed directly to ``/patch``. Objects are compared recursively member by
+  member with RFC 6901 pointer escaping, arrays are aligned by a
+  longest-common-subsequence so only the differing elements are touched,
+  and type or scalar changes become ``replace``.
+
 * ``POST /canonicalize`` accepts ``{"document": ...}`` and returns the
   RFC 8785 (JCS) canonical JSON text together with its SHA-256 digest.
 
@@ -38,11 +45,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .canonicalize import CanonicalizationError, canonicalize
+from .diff import diff
 from .jsonutil import MISSING, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
 from .validate import SchemaValidationError, build_validator, leaf_errors
 
-app = FastAPI(title="JSON Merge, Patch, Validate & Canonicalize Service", version="1.3.0")
+app = FastAPI(title="JSON Merge, Patch, Validate & Canonicalize Service", version="1.4.0")
 
 
 def escape_pointer(token: str) -> str:
@@ -162,6 +170,16 @@ def patch_endpoint(request: PatchRequest):
             content["path"] = exc.path
         return JSONResponse(status_code=422, content=content)
     return {"document": document}
+
+
+class DiffRequest(BaseModel):
+    source: Any = Field(...)
+    target: Any = Field(...)
+
+
+@app.post("/diff")
+def diff_endpoint(request: DiffRequest):
+    return {"operations": diff(request.source, request.target)}
 
 
 class CanonicalizeRequest(BaseModel):
